@@ -1,0 +1,155 @@
+version: '3.8'
+
+# =============================================================================
+# AI LLMOps Orchestration: OmniRoute + Hermes Agent Integration
+# =============================================================================
+# This docker-compose.yml integrates:
+# 1. OmniRoute - LLM router with provider abstraction
+# 2. Hermes Agent - Autonomous AI agent system
+# 
+# Services communicate via shared internal network
+# Both systems are independently configurable via their own .env files
+# =============================================================================
+
+networks:
+  llm-ops-network:
+    driver: bridge
+
+services:
+  # =============================================================================
+  # OMNIROUTE SERVICE
+  # =============================================================================
+  omniroute:
+    image: ghcr.io/diegosouzapw/omniroute:latest
+    container_name: omniroute
+    restart: unless-stopped
+    env_file:
+      - ./omniroute/.env
+    environment:
+      - DATA_DIR=/app/data
+      - OMNIROUTE_BASE_PATH=/app/data
+      - PORT=20128
+      - DASHBOARD_PORT=20128
+      - API_PORT=20129
+      - API_HOST=0.0.0.0
+      - LIVE_WS_PORT=20132
+      - LIVE_WS_HOST=0.0.0.0
+      - REDIS_URL=redis://omniroute-redis:6379
+      - NODE_OPTIONS=--max-old-space-size=2048
+      # Security - MUST be set in .env
+      - AUTH_SECRET=
+      - DASHBOARD_AUTH_USER=
+      - DASHBOARD_AUTH_PASS=
+    ports:
+      - "20128:20128"   # Dashboard
+      - "20129:20129"   # API
+      - "20132:20132"   # Live WS
+    volumes:
+      - ./omniroute/data:/app/data
+      - ./omniroute/.env:/app/.env:ro
+    depends_on:
+      - omniroute-redis
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - llm-ops-network
+
+  # Redis for OmniRoute rate limiting
+  omniroute-redis:
+    image: docker.io/library/redis:8.6.5-alpine
+    container_name: omniroute-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - omniroute-redis-data:/data
+    networks:
+      - llm-ops-network
+
+  # =============================================================================
+  # HERMES AGENT SERVICE  
+  # =============================================================================
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes
+    restart: unless-stopped
+    # IMPORTANT: DO NOT override entrypoint - use s6-overlay
+    command: ["gateway", "run"]
+    env_file:
+      - ./hermes-agent-docker-deploy/.env
+    environment:
+      - HERMES_UID=${HERMES_UID:-1000}
+      - HERMES_GID=${HERMES_GID:-1000}
+      # Dashboard configuration
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_HOST=0.0.0.0
+      - HERMES_DASHBOARD_PORT=9119
+    ports:
+      - "8642:8642"   # Gateway / OpenAI-compatible API
+      - "9119:9119"   # Web Dashboard
+    volumes:
+      - ./hermes-agent-docker-deploy:/opt/data
+      - hermes-data:/opt/data
+    depends_on:
+      # Optional: Add health check dependency if needed
+      # - hermes-healthcheck
+    networks:
+      - llm-ops-network
+    healthcheck:
+      test: ["CMD", "hermes", "doctor", "--quiet"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 2g
+    cpus: 2.0
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  hermes-data:
+    driver: local
+  omniroute-redis-data:
+    driver: local
+
+# =============================================================================
+# USAGE NOTES
+# =============================================================================
+#
+# 1. Copy example env files:
+#    cp ./omniroute/.env.example ./omniroute/.env
+#    cp ./hermes-agent-docker-deploy/.env.example ./hermes-agent-docker-deploy/.env
+#
+# 2. Configure .env files:
+#    - OmniRoute: Set AUTH_SECRET, dashboard credentials, LLM provider keys
+#    - Hermes: Set HERMES_UID/GID, configure skills/plugins as needed
+#
+# 3. Start the stack:
+#    docker compose up -d
+#
+# 4. Access points:
+#    - OmniRoute Dashboard: http://localhost:20128
+#    - OmniRoute API: http://localhost:20129/v1/*
+#    - Hermes Dashboard: http://localhost:9119
+#    - Hermes API: http://localhost:8642/v1/
+#
+# 5. Integration pattern:
+#    - Hermes can call OmniRoute API as an LLM provider
+#    - Configure Hermes to use: http://omniroute:20129/v1/chat/completions
+#    - Or expose OmniRoute externally and configure Hermes to use localhost:20129
+#
+# =============================================================================
